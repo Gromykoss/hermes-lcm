@@ -221,6 +221,10 @@ environment variables:
 | `LCM_ROLLUP_BUILDS_PER_PASS` | `2` | Maximum rollups built by one automatic pass or `/lcm rollups rebuild` command |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
+| `LCM_PERIODIC_BACKUP_ENABLED` | `false` | Opt in to process-local, best-effort verified backup publication |
+| `LCM_PERIODIC_BACKUP_INTERVAL_SECONDS` | `3600` | Positive finite interval between generation attempts |
+| `LCM_PERIODIC_BACKUP_KEEP_LAST` | `3` | Positive integer count of immutable generations to retain |
+| `LCM_PERIODIC_BACKUP_DESTINATION` | empty | Existing local private (`0700`, current-user-owned) destination; required when enabled |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup (previous behavior); a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
 | `LCM_EMBEDDINGS_ENABLED` | `false` | Opt in to embedding warmup, backfill, and semantic retrieval storage |
@@ -238,6 +242,41 @@ environment variables:
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
 | `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
+
+### Optional periodic backup publication
+
+Periodic backup is disabled by default. Enabling it requires a positive finite
+interval, a positive integer retention count, an existing current-user-owned
+private destination, and an existing private externalized-payload root (the
+configured `LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH`, or
+`HERMES_HOME/lcm-large-outputs`). Invalid optional settings produce a typed
+backup error instead of coercion or a substitute path. Optional backup failures
+never make normal LCM construction, reads, writes, cloning, or shutdown
+unavailable. Disabled mode creates no backup record, worker, directory,
+snapshot, or backup I/O.
+
+Each canonical SQLite database has at most one process-local source record, one
+continuously observed payload root, and one source-owned worker. Compatible
+engines share it. A missing, inaccessible, unsafe, replaced, or differently
+configured root suspends publication for that source for the rest of the
+process, even if the same path later reappears. There is no automatic root
+resume, retry-based re-admission, multi-root routing, or durable root identity.
+
+The private destination namespace contains immutable generation directories and
+a strict `latest-good.json` pointer. Publication snapshots SQLite through its
+supported read-only backup semantics, enumerates payload references with LCM's
+production recovery parser, copies payloads through trusted directory file
+descriptors, and validates all staged bytes before atomically publishing the
+pointer. Unsafe or racy pointer entries fail closed and are preserved for manual
+operator action. Retention runs only after a durable verified pointer and never
+deletes its current target.
+
+These generations are optional best-effort safety copies, not a public restore
+format. There is no automatic restore. Byte validation protects staged
+publication and pointer history, but cannot prove that arbitrary uncooperative
+input writers cannot race without a cooperation protocol. Test success is not
+live restore, power-loss, NFS, multi-process, or multi-host proof. Use only a
+supported local private filesystem.
 
 ### Evidence and adaptive retrieval (0.21 RC)
 

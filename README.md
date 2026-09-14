@@ -391,6 +391,10 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
+| `LCM_PERIODIC_BACKUP_ENABLED` | `false` | Opt in to process-local, best-effort verified backup publication |
+| `LCM_PERIODIC_BACKUP_INTERVAL_SECONDS` | `3600` | Positive finite interval between generation attempts |
+| `LCM_PERIODIC_BACKUP_KEEP_LAST` | `3` | Positive integer generation retention count |
+| `LCM_PERIODIC_BACKUP_DESTINATION` | empty | Existing local private (`0700`, current-user-owned) destination; required when enabled |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
 
@@ -398,6 +402,30 @@ When `LCM_FRESH_TAIL_MAX_TOKENS` is enabled, the protected suffix must satisfy
 both the message-count and token bounds. The newest message is never dropped,
 and a boundary that would begin inside an assistant tool-call/result group is
 moved back to that assistant even when doing so exceeds a configured bound.
+
+### Periodic backup boundary
+
+Periodic backup is disabled by default. When enabled with all four strict
+settings above, it publishes immutable generations containing a read-only
+SQLite snapshot plus the externalized payload files referenced by that
+snapshot. Invalid values are reported as a backup registration error and never
+coerced; ordinary LCM construction, reads, writes, cloning, and shutdown remain
+available. The disabled path creates no backup registry record, thread,
+directory, snapshot, or other backup I/O.
+
+This is an optional best-effort safety copy, not a restore service. It supports
+one continuously observed externalized-payload root and one worker per canonical
+database within one process, on a current-user-owned private local filesystem.
+A missing, replaced, inaccessible, or differently configured root suspends that
+source for the rest of the process. There is no automatic root resume,
+multi-root routing, or automatic restore.
+
+Staged generations and `latest-good.json` are byte-validated before publication,
+and unsafe existing pointer entries fail closed without replacement. This
+protects the published history but cannot prove that arbitrary uncooperative
+input writers will not race without a cooperation protocol. Passing tests are
+not proof of live restore behavior, power-loss durability, NFS safety, or
+multi-host coordination.
 
 ### Filtering and storage settings
 

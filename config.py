@@ -309,6 +309,10 @@ class _EnvFieldSpec:
 # preset-field lookups from the same list so the field/env/type mapping is not
 # duplicated. Order mirrors the historical ``from_env`` order for readability.
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
+    _EnvFieldSpec("periodic_backup_enabled", "LCM_PERIODIC_BACKUP_ENABLED", bool),
+    _EnvFieldSpec("periodic_backup_interval_seconds", "LCM_PERIODIC_BACKUP_INTERVAL_SECONDS", float),
+    _EnvFieldSpec("periodic_backup_keep_last", "LCM_PERIODIC_BACKUP_KEEP_LAST", int),
+    _EnvFieldSpec("periodic_backup_destination", "LCM_PERIODIC_BACKUP_DESTINATION", str),
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
@@ -603,6 +607,15 @@ class LCMConfig:
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
 
+    # -- Optional process-local periodic backup publication ---
+    # Strict validation is intentionally deferred to periodic_backup so an
+    # invalid optional setting is reported as a typed registration error and
+    # can never break ordinary LCM construction or be silently coerced.
+    periodic_backup_enabled: Any = False
+    periodic_backup_interval_seconds: Any = 3600.0
+    periodic_backup_keep_last: Any = 3
+    periodic_backup_destination: Any = ""
+
     # -- Embeddings (default-off until a provider/model are configured) ---
     embeddings_enabled: bool = False
     # lcm_recall cross-encoder rerank stage (voyage rerank-2.5-lite over the top
@@ -790,6 +803,20 @@ class LCMConfig:
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
 
+        # Preserve the exact optional-backup scalar values.  The backup
+        # subsystem owns strict parsing; the generic env helpers deliberately
+        # fall back to defaults and would turn malformed opt-in policy into a
+        # different, apparently valid policy.
+        strict_backup_env = {
+            "periodic_backup_enabled": "LCM_PERIODIC_BACKUP_ENABLED",
+            "periodic_backup_interval_seconds": "LCM_PERIODIC_BACKUP_INTERVAL_SECONDS",
+            "periodic_backup_keep_last": "LCM_PERIODIC_BACKUP_KEEP_LAST",
+            "periodic_backup_destination": "LCM_PERIODIC_BACKUP_DESTINATION",
+        }
+        for field_name, env_key in strict_backup_env.items():
+            if env_key in os.environ:
+                setattr(c, field_name, os.environ[env_key])
+
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
         c.fresh_tail_count, source, warning = _parse_int_env_with_source(
@@ -843,7 +870,7 @@ class LCMConfig:
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
         for spec in ENV_FIELD_SPECS:
-            if spec.name in _SOURCE_TRACKED_ENV_FIELDS:
+            if spec.name in _SOURCE_TRACKED_ENV_FIELDS or spec.name in strict_backup_env:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))

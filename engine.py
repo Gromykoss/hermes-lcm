@@ -124,6 +124,12 @@ from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
+from .periodic_backup import (
+    LeaseHandle,
+    Registration,
+    acquire_backup_lease,
+    release_backup_lease,
+)
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
@@ -391,6 +397,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._periodic_backup_registration = Registration(
+            "disabled", "not_yet_registered"
+        )
+        self._periodic_backup_lease_handle: LeaseHandle | None = None
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
@@ -735,12 +745,39 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     model=self._assertion_extraction_model(),
                     timeout_seconds=self._assertion_extraction_timeout(),
                 )
+            self._acquire_periodic_backup_lease()
         except Exception:
             self._close_storage()
             raise
 
+    def _acquire_periodic_backup_lease(self, *, preserve_prior_on_error: bool = False) -> None:
+        """Refresh optional backup presentation without weakening exact ownership."""
+        prior = self._periodic_backup_lease_handle
+        try:
+            registration, acquired = acquire_backup_lease(self)
+        except Exception as exc:
+            logger.warning("LCM periodic backup registration failed", exc_info=True)
+            registration = Registration("error", f"registration_failed:{type(exc).__name__}")
+            acquired = None
+        self._periodic_backup_registration = registration
+        if acquired is not None:
+            self._periodic_backup_lease_handle = acquired
+            if prior is not None:
+                release_backup_lease(prior)
+        elif not preserve_prior_on_error:
+            self._periodic_backup_lease_handle = None
+
+    def _release_periodic_backup_lease(self) -> None:
+        handle = self._periodic_backup_lease_handle
+        self._periodic_backup_lease_handle = None
+        release_backup_lease(handle)
+
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
+        # Exact scheduling authority is released before any SQLite helper is
+        # closed.  Release only advances process-local state and never waits for
+        # snapshot validation, pointer fsync, retention, or worker exit.
+        self._release_periodic_backup_lease()
         for attr in (
             "_adaptive_retrieval",
             "_store",
@@ -838,6 +875,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             store = getattr(self, "_store", None)
             if store is not None:
                 store._hermes_home = hermes_home
+            # A configured DB can stay open while its payload-root presentation
+            # changes.  Acquire first: a conflicting/different-root request has
+            # no authority to recursively release the original exact lease.
+            self._acquire_periodic_backup_lease(preserve_prior_on_error=True)
             self._reset_profile_runtime_state()
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
@@ -6655,6 +6696,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
+        self._release_periodic_backup_lease()
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.close()
         self._store.close()
