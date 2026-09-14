@@ -32,6 +32,7 @@ _MAX_METADATA_BYTES = 1024 * 1024
 _MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
 _GENERATION_PREFIX = "generation-"
 _STAGE_PREFIX = ".stage-"
+_MAX_CANCELLATION_WAIT_SECONDS = 24 * 60 * 60
 
 
 class BackupError(RuntimeError):
@@ -339,18 +340,47 @@ def _worker_finished(
     worker_token: str,
     worker: threading.Thread,
 ) -> None:
-    """Ensure a failed watcher cannot strand an ownerless source record."""
+    """Leave ownership intact until an external observer can join this worker.
+
+    A thread is still alive while its target's ``finally`` block runs.  Clearing
+    the slot here would let a concurrent acquisition start a same-source worker
+    before this one has actually exited.
+    """
+
+
+def _finalize_joined_worker_locked(
+    source_key: str,
+    source: _BackupSource,
+    worker: threading.Thread,
+) -> bool:
+    """Finalize a worker that an external observer already joined."""
+
+    if source.worker is not worker:
+        return False
+    source.worker = None
+    if source.watcher is not None and not source.watcher.is_alive():
+        source.watcher = None
+    if not source.leases:
+        _SOURCES.pop(source_key, None)
+        return True
+    if source.state == "STOPPING":
+        _start_worker_locked(source, successor=True)
+    return False
+
+
+def _join_exited_worker(source_key: str) -> None:
+    """Observe and join an exited worker without holding the registry lock."""
+
     with _REGISTRY_LOCK:
         source = _SOURCES.get(source_key)
-        if (
-            source is None
-            or source.worker_token != worker_token
-            or source.worker is not worker
-        ):
+        worker = source.worker if source is not None else None
+        if worker is None or worker.is_alive():
             return
-        if not source.leases:
-            source.worker = None
-            _SOURCES.pop(source_key, None)
+    worker.join()
+    with _REGISTRY_LOCK:
+        source = _SOURCES.get(source_key)
+        if source is not None:
+            _finalize_joined_worker_locked(source_key, source, worker)
 
 
 def _start_watcher_locked(source: _BackupSource, old_worker: threading.Thread) -> bool:
@@ -421,6 +451,7 @@ def acquire_backup_lease(engine: Any) -> tuple[Registration, LeaseHandle | None]
         return built, None
 
     candidate = built
+    _join_exited_worker(candidate.source_key)
     with _REGISTRY_LOCK:
         source = _SOURCES.get(candidate.source_key)
         if source is not None:
@@ -433,6 +464,16 @@ def acquire_backup_lease(engine: Any) -> tuple[Registration, LeaseHandle | None]
                 or source.candidate.root_observation != candidate.root_observation
             ):
                 _suspend_locked(source, "root_discontinuity")
+                return _registration_for(source), None
+            if (
+                source.state == "ERROR"
+                and not source.leases
+                and source.worker is not None
+                and source.worker.is_alive()
+            ):
+                # In particular this contains watcher-start failure: the old
+                # source retains its slot until a later external observer sees
+                # and joins the actual thread exit.
                 return _registration_for(source), None
             lease = LeaseHandle(candidate.source_key, uuid.uuid4().hex)
             source.leases[lease.lease_id] = lease
@@ -475,6 +516,7 @@ def release_backup_lease(handle: LeaseHandle | None) -> None:
 def periodic_backup_source_status(source_key: str) -> dict[str, Any] | None:
     """Return a read-only diagnostic projection without exposing authority."""
 
+    _join_exited_worker(source_key)
     with _REGISTRY_LOCK:
         source = _SOURCES.get(source_key)
         if source is None:
@@ -527,8 +569,26 @@ def _worker_main(source_key: str, worker_token: str) -> None:
                     source.epoch += 1
                     source.cancel.set()
             return
-        if cancel.wait(snapshot.interval_seconds):
+        if _wait_for_cancellation(cancel, snapshot.interval_seconds):
             return
+
+
+def _wait_for_cancellation(cancel: threading.Event, interval_seconds: float) -> bool:
+    """Wait monotonically in platform-safe chunks for any accepted interval."""
+
+    remaining = interval_seconds
+    while remaining > 0:
+        chunk = min(remaining, _MAX_CANCELLATION_WAIT_SECONDS, threading.TIMEOUT_MAX)
+        started = time.monotonic()
+        if cancel.wait(chunk):
+            return True
+        elapsed = time.monotonic() - started
+        if elapsed <= 0:
+            # Event.wait() is not specified to return spuriously, but keep a
+            # mocked or unusual implementation from creating a hot loop.
+            elapsed = chunk
+        remaining -= elapsed
+    return cancel.is_set()
 
 
 def _call_fault(fault_hook: Callable[..., Any] | None, stage: str, snapshot: BackupSnapshot) -> None:
@@ -680,6 +740,9 @@ def _pointer_entry(namespace: Path) -> tuple[str, bytes | None]:
                 (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
                 or not stat.S_ISREG(opened.st_mode)
                 or opened.st_nlink != 1
+                or (hasattr(os, "getuid") and opened.st_uid != os.getuid())
+                or opened.st_mode & 0o077
+                or opened.st_size != before.st_size
             ):
                 raise UnsafeExistingPointer("pointer_lstat_open_mismatch")
             data = b""
@@ -696,6 +759,15 @@ def _pointer_entry(namespace: Path) -> tuple[str, bytes | None]:
                 (final.st_dev, final.st_ino, final.st_size)
                 != (before.st_dev, before.st_ino, before.st_size)
                 or (rebound.st_dev, rebound.st_ino) != (before.st_dev, before.st_ino)
+                or not stat.S_ISREG(final.st_mode)
+                or not stat.S_ISREG(rebound.st_mode)
+                or final.st_nlink != 1
+                or rebound.st_nlink != 1
+                or (hasattr(os, "getuid") and final.st_uid != os.getuid())
+                or (hasattr(os, "getuid") and rebound.st_uid != os.getuid())
+                or final.st_mode & 0o077
+                or rebound.st_mode & 0o077
+                or rebound.st_size != before.st_size
             ):
                 raise UnsafeExistingPointer("pointer_changed_while_reading")
             return "VALID", data
@@ -881,6 +953,37 @@ def _hash_private_entry(directory: Path, name: str) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _private_entry_identity(directory: Path, name: str) -> tuple[int, ...]:
+    """Return a stable private-entry identity without trusting path metadata alone."""
+
+    fd, before, opened = _open_private_regular_at(directory, name)
+    try:
+        final = os.fstat(fd)
+        if (
+            (before.st_dev, before.st_ino, before.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or (final.st_dev, final.st_ino, final.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (hasattr(os, "getuid") and final.st_uid != os.getuid())
+            or final.st_mode & 0o077
+        ):
+            raise BackupError("generation_entry_identity_changed")
+        return (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            final.st_mode,
+            final.st_uid,
+            final.st_nlink,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        )
+    finally:
+        os.close(fd)
+
+
 def _verify_generation(directory: Path, manifest: dict[str, Any]) -> None:
     _assert_private_directory(directory, reason="unsafe_generation_directory")
     files = manifest.get("files")
@@ -890,12 +993,14 @@ def _verify_generation(directory: Path, manifest: dict[str, Any]) -> None:
     actual_names = {entry.name for entry in directory.iterdir()}
     if actual_names != expected_names:
         raise BackupError("generation_file_set_mismatch")
+    verified: dict[str, tuple[str, int, tuple[int, ...]]] = {}
     for name, metadata in files.items():
         if Path(name).name != name or not isinstance(metadata, dict):
             raise BackupError("invalid_manifest_entry")
         file_hash, size = _hash_private_entry(directory, name)
         if metadata != {"sha256": file_hash, "size": size}:
             raise BackupError("generation_byte_mismatch")
+        verified[name] = (file_hash, size, _private_entry_identity(directory, name))
     uri = f"file:{quote(str(directory / 'lcm.db'))}?mode=ro&immutable=1"
     conn = sqlite3.connect(uri, uri=True)
     try:
@@ -910,6 +1015,13 @@ def _verify_generation(directory: Path, manifest: dict[str, Any]) -> None:
                 raise BackupError("staged_payload_missing")
     finally:
         conn.close()
+    # Bind every trusted child's identity and bytes through the end of recovery
+    # validation.  A same-size mutation after its first hash must not publish.
+    for name, expected in verified.items():
+        file_hash, size = _hash_private_entry(directory, name)
+        identity = _private_entry_identity(directory, name)
+        if (file_hash, size, identity) != expected:
+            raise BackupError("generation_entry_changed_during_validation")
 
 
 def _write_new_private_json(directory: Path, name: str, value: Any) -> bytes:
@@ -1063,6 +1175,9 @@ def run_periodic_backup(
             _verify_generation(stage, manifest)
             _call_fault(fault_hook, "after_final_validation_before_commit_claim", snapshot)
             _observe_root(snapshot)
+            # Keep the final trusted-child observation immediately adjacent to
+            # the brief registry-only linearization claim.
+            _verify_generation(stage, manifest)
             if not snapshot.commit_claim(snapshot):
                 raise PublicationCancelled("commit_claim_rejected")
             claimed = True
@@ -1097,6 +1212,10 @@ def _reset_registry_for_tests(timeout: float = 2.0) -> None:
         release_backup_lease(handle)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        with _REGISTRY_LOCK:
+            source_keys = list(_SOURCES)
+        for source_key in source_keys:
+            _join_exited_worker(source_key)
         with _REGISTRY_LOCK:
             source_threads = [
                 thread

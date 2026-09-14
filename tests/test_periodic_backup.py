@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -154,6 +156,34 @@ def test_strict_backup_environment_values_are_not_coerced(monkeypatch):
     assert config.periodic_backup_enabled == "true"
     assert config.periodic_backup_interval_seconds == "bogus"
     assert config.periodic_backup_keep_last == "2.5"
+
+
+def test_accepted_max_finite_interval_keeps_real_worker_active(tmp_path, monkeypatch):
+    completed = threading.Event()
+    failures: list[type[BaseException]] = []
+
+    def one_backup(snapshot, *, cancel, fault_hook=None):
+        completed.set()
+        return {}
+
+    def capture(args: threading.ExceptHookArgs) -> None:
+        failures.append(args.exc_type)
+
+    monkeypatch.setattr(pb, "run_periodic_backup", one_backup)
+    monkeypatch.setattr(threading, "excepthook", capture)
+    config, home, _root = _config(
+        tmp_path,
+        periodic_backup_interval_seconds=sys.float_info.max,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(home))
+    try:
+        assert completed.wait(2)
+        key = str(Path(engine._store.db_path).resolve(strict=True))
+        status = pb.periodic_backup_source_status(key)
+        assert failures == []
+        assert status and status["state"] == "ACTIVE" and status["worker_alive"]
+    finally:
+        engine.shutdown()
 
 
 def test_r2_compatible_clone_shares_one_source_root_and_worker(tmp_path, monkeypatch):
@@ -317,6 +347,75 @@ def test_n2_delayed_stop_admits_pending_and_starts_one_successor(tmp_path, monke
         second.shutdown()
 
 
+def test_n2_source_slot_is_retained_until_old_worker_actual_exit(tmp_path, monkeypatch):
+    first_entered = threading.Event()
+    successor_entered = threading.Event()
+    let_body_return = threading.Event()
+    finalizer_entered = threading.Event()
+    let_thread_exit = threading.Event()
+    calls: list[str] = []
+
+    def controlled(snapshot, *, cancel, fault_hook=None):
+        calls.append(snapshot.worker_token)
+        if len(calls) == 1:
+            first_entered.set()
+            assert let_body_return.wait(2)
+            return {}
+        successor_entered.set()
+        cancel.wait(2)
+        raise pb.PublicationCancelled("successor stop")
+
+    real_finished = pb._worker_finished
+    old_worker: list[threading.Thread] = []
+
+    def pause_in_finalizer(source_key, worker_token, worker):
+        real_finished(source_key, worker_token, worker)
+        if old_worker and worker is old_worker[0]:
+            finalizer_entered.set()
+            assert let_thread_exit.wait(2)
+
+    monkeypatch.setattr(pb, "run_periodic_backup", controlled)
+    monkeypatch.setattr(pb, "_worker_finished", pause_in_finalizer)
+    config, home, _root = _config(tmp_path)
+    first = LCMEngine(config=config, hermes_home=str(home))
+    second = None
+    try:
+        assert first_entered.wait(2)
+        key = str(Path(first._store.db_path).resolve(strict=True))
+        with pb._REGISTRY_LOCK:
+            old_worker.append(pb._SOURCES[key].worker)
+        first.shutdown()
+        let_body_return.set()
+        assert finalizer_entered.wait(2)
+        assert old_worker[0].is_alive()
+
+        second = LCMEngine(config=config, hermes_home=str(home))
+        assert second._periodic_backup_registration.status == "pending"
+        assert not successor_entered.wait(0.05)
+        with pb._REGISTRY_LOCK:
+            assert pb._SOURCES[key].worker is old_worker[0]
+        workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.is_alive()
+            and thread.name.startswith("lcm-periodic-backup-")
+            and "watcher" not in thread.name
+        ]
+        assert workers == old_worker
+
+        let_thread_exit.set()
+        assert successor_entered.wait(2)
+        old_worker[0].join(2)
+        assert not old_worker[0].is_alive()
+        status = pb.periodic_backup_source_status(key)
+        assert status and status["state"] == "ACTIVE" and status["worker_alive"]
+    finally:
+        let_body_return.set()
+        let_thread_exit.set()
+        if second is not None:
+            second.shutdown()
+
+
 def test_pending_all_cancelled_prevents_successor(tmp_path, monkeypatch):
     entered, exit_worker, calls = _blocking_worker(monkeypatch, ignore_cancel=True)
     config, home, _root = _config(tmp_path)
@@ -385,6 +484,82 @@ def test_n4_thread_start_faults_are_typed_usable_and_leak_free(
     pending.shutdown()
 
 
+def test_n4_watcher_start_fault_retains_slot_until_actual_exit(tmp_path, monkeypatch):
+    first_entered = threading.Event()
+    successor_entered = threading.Event()
+    let_body_return = threading.Event()
+    finalizer_entered = threading.Event()
+    let_thread_exit = threading.Event()
+    calls = 0
+
+    def controlled(snapshot, *, cancel, fault_hook=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_entered.set()
+            assert let_body_return.wait(2)
+            return {}
+        successor_entered.set()
+        cancel.wait(2)
+        raise pb.PublicationCancelled("replacement stop")
+
+    real_finished = pb._worker_finished
+    old_worker: list[threading.Thread] = []
+
+    def pause_in_finalizer(source_key, worker_token, worker):
+        real_finished(source_key, worker_token, worker)
+        if old_worker and worker is old_worker[0]:
+            finalizer_entered.set()
+            assert let_thread_exit.wait(2)
+
+    real_start = threading.Thread.start
+    fail_watcher = {"armed": True}
+
+    def start(thread):
+        if fail_watcher["armed"] and "backup-watcher" in thread.name:
+            fail_watcher["armed"] = False
+            raise RuntimeError("watcher-start")
+        return real_start(thread)
+
+    monkeypatch.setattr(pb, "run_periodic_backup", controlled)
+    monkeypatch.setattr(pb, "_worker_finished", pause_in_finalizer)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    config, home, _root = _config(tmp_path)
+    first = LCMEngine(config=config, hermes_home=str(home))
+    replacement = None
+    try:
+        assert first_entered.wait(2)
+        key = str(Path(first._store.db_path).resolve(strict=True))
+        with pb._REGISTRY_LOCK:
+            old_worker.append(pb._SOURCES[key].worker)
+        first.shutdown()
+        status = pb.periodic_backup_source_status(key)
+        assert status and status["state"] == "ERROR" and status["lease_count"] == 0
+        let_body_return.set()
+        assert finalizer_entered.wait(2)
+        assert old_worker[0].is_alive()
+
+        contained = LCMEngine(config=config, hermes_home=str(home))
+        assert contained._periodic_backup_registration.status == "error"
+        assert contained._periodic_backup_lease_handle is None
+        assert not successor_entered.wait(0.05)
+        with pb._REGISTRY_LOCK:
+            assert pb._SOURCES[key].worker is old_worker[0]
+        contained.shutdown()
+
+        let_thread_exit.set()
+        old_worker[0].join(2)
+        assert not old_worker[0].is_alive()
+        replacement = LCMEngine(config=config, hermes_home=str(home))
+        assert replacement._periodic_backup_registration.status == "active"
+        assert successor_entered.wait(2)
+    finally:
+        let_body_return.set()
+        let_thread_exit.set()
+        if replacement is not None:
+            replacement.shutdown()
+
+
 def test_n3_publication_pointer_verification_and_retention(tmp_path, monkeypatch):
     original_run = pb.run_periodic_backup
     entered, _exit, _calls = _blocking_worker(monkeypatch)
@@ -441,6 +616,45 @@ def test_n3_same_size_staged_mutation_rejects_without_pointer_or_retention_chang
     engine.shutdown()
 
 
+def test_n3_post_final_hash_mutation_preserves_prior_verified_generation(
+    tmp_path, monkeypatch
+):
+    original_run = pb.run_periodic_backup
+    entered, _exit, _calls = _blocking_worker(monkeypatch)
+    config, home, root = _config(tmp_path)
+    engine = LCMEngine(config=config, hermes_home=str(home))
+    assert entered.wait(2)
+    payload_name = "final-race.json"
+    (root / payload_name).write_text(json.dumps({"content": "AAAA"}))
+    (root / payload_name).chmod(0o600)
+    engine._store.append(
+        "s",
+        {"role": "tool", "content": f"[Externalized payload: chars=4; ref={payload_name}]"},
+    )
+    first = _snapshot(engine)
+    pointer_before = _publish(original_run, first)
+    raw_pointer_before = _pointer_bytes(first)
+    generations_before = _generation_names(first)
+    second = _snapshot(engine)
+    mutated = threading.Event()
+
+    def mutate(stage, snapshot):
+        if stage == "after_final_validation_before_commit_claim":
+            path = _namespace(snapshot) / f".stage-{snapshot.generation_id}" / payload_name
+            data = path.read_bytes()
+            path.write_bytes(data.replace(b"AAAA", b"BBBB", 1))
+            path.chmod(0o600)
+            mutated.set()
+
+    with pytest.raises(pb.BackupError, match="generation_"):
+        _publish(original_run, second, hook=mutate)
+    assert mutated.is_set()
+    assert _pointer_bytes(first) == raw_pointer_before
+    assert pb.read_verified_pointer(first) == pointer_before
+    assert _generation_names(first) == generations_before
+    engine.shutdown()
+
+
 def test_n3_verified_pointer_rejects_altered_published_generation(
     tmp_path, monkeypatch
 ):
@@ -491,15 +705,18 @@ def test_g2_release_before_claim_cannot_publish(tmp_path, monkeypatch):
     at_g2 = threading.Event()
     continue_g2 = threading.Event()
     result: list[BaseException] = []
+    real_claim = snapshot.commit_claim
 
-    def barrier(stage, _snapshot_value):
-        if stage == "after_final_validation_before_commit_claim":
-            at_g2.set()
-            assert continue_g2.wait(2)
+    def barrier_claim(snapshot_value):
+        at_g2.set()
+        assert continue_g2.wait(2)
+        return real_claim(snapshot_value)
+
+    snapshot = replace(snapshot, commit_claim=barrier_claim)
 
     def publish():
         try:
-            _publish(original_run, snapshot, hook=barrier)
+            _publish(original_run, snapshot)
         except BaseException as exc:
             result.append(exc)
 
@@ -530,15 +747,18 @@ def test_n1_different_root_suspension_at_g2_blocks_old_root_publish(
     at_g2 = threading.Event()
     continue_g2 = threading.Event()
     result: list[BaseException] = []
+    real_claim = snapshot.commit_claim
 
-    def barrier(stage, _snapshot_value):
-        if stage == "after_final_validation_before_commit_claim":
-            at_g2.set()
-            assert continue_g2.wait(2)
+    def barrier_claim(snapshot_value):
+        at_g2.set()
+        assert continue_g2.wait(2)
+        return real_claim(snapshot_value)
+
+    snapshot = replace(snapshot, commit_claim=barrier_claim)
 
     def publish():
         try:
-            _publish(original_run, snapshot, hook=barrier)
+            _publish(original_run, snapshot)
         except BaseException as exc:
             result.append(exc)
 
@@ -732,4 +952,45 @@ def test_f2_lstat_to_open_replacement_is_rejected_and_preserved(tmp_path, monkey
     with pytest.raises(pb.UnsafeExistingPointer, match="mismatch"):
         pb.read_verified_pointer(snapshot)
     assert pointer.exists()
+    engine.shutdown()
+
+
+def test_f2_after_open_hardlink_race_is_rejected_and_pointer_preserved(
+    tmp_path, monkeypatch
+):
+    original_run = pb.run_periodic_backup
+    entered, _exit, _calls = _blocking_worker(monkeypatch)
+    config, home, _root = _config(tmp_path)
+    engine = LCMEngine(config=config, hermes_home=str(home))
+    assert entered.wait(2)
+    snapshot = _snapshot(engine)
+    pointer_value = _publish(original_run, snapshot)
+    namespace = _namespace(snapshot)
+    pointer = namespace / "latest-good.json"
+    raw_pointer = pointer.read_bytes()
+    added_link = namespace / "pointer-race-link"
+    real_read = pb.os.read
+    raced = threading.Event()
+
+    def link_after_open(fd, size):
+        opened = os.fstat(fd)
+        current = pointer.stat()
+        if not raced.is_set() and (opened.st_dev, opened.st_ino) == (
+            current.st_dev,
+            current.st_ino,
+        ):
+            os.link(pointer, added_link)
+            raced.set()
+        return real_read(fd, size)
+
+    monkeypatch.setattr(pb.os, "read", link_after_open)
+    try:
+        with pytest.raises(pb.UnsafeExistingPointer, match="changed"):
+            pb.read_verified_pointer(snapshot)
+        assert raced.is_set()
+        assert pointer.read_bytes() == raw_pointer
+    finally:
+        if added_link.exists():
+            added_link.unlink()
+    assert pb.read_verified_pointer(snapshot) == pointer_value
     engine.shutdown()
