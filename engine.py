@@ -387,10 +387,49 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
+    _LAZY_STORAGE_ATTRS = frozenset(
+        (
+            "_store",
+            "_dag",
+            "_lifecycle",
+            "_assertions",
+            "_query_views",
+            "_adaptive_retrieval",
+            "_assertion_extractor",
+        )
+    )
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in object.__getattribute__(self, "_LAZY_STORAGE_ATTRS"):
+            state = object.__getattribute__(self, "__dict__")
+            if (
+                "_storage_lock" in state
+                and not state.get("_storage_bound", False)
+                and not state.get("_storage_binding", False)
+                and not state.get("_storage_shutdown", False)
+            ):
+                object.__getattribute__(self, "_ensure_storage")()
+        return object.__getattribute__(self, name)
+
     def __init__(self, config: LCMConfig | None = None,
-                 hermes_home: str = ""):
+                 hermes_home: str = "",
+                 _lazy_storage: bool = False):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        db_path = self._resolve_db_path(hermes_home)
+        self._storage_db_path = db_path
+        self._storage_hermes_home = hermes_home
+        self._storage_lock = threading.RLock()
+        self._storage_bound = False
+        self._storage_binding = False
+        self._storage_shutdown = False
+        self._store = None
+        self._dag = None
+        self._lifecycle = None
+        self._assertions = None
+        self._query_views = None
+        self._adaptive_retrieval = None
+        self._assertion_extractor = None
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
@@ -406,8 +445,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._assertion_extraction_last_error = ""
         self._assertion_extraction_last_model = ""
 
-        db_path = self._resolve_db_path(hermes_home)
-        self._bind_storage(db_path, hermes_home)
+        if not _lazy_storage:
+            self._bind_storage(db_path, hermes_home)
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -640,6 +679,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         clone = type(self)(
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
+            _lazy_storage=True,
         )
         clone.model = self.model
         clone.base_url = self.base_url
@@ -692,6 +732,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        db_path = Path(db_path)
+        self._storage_db_path = db_path
+        self._storage_hermes_home = hermes_home
+        if self._storage_bound:
+            return
+        self._storage_shutdown = False
+        self._storage_binding = True
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
@@ -735,12 +782,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     model=self._assertion_extraction_model(),
                     timeout_seconds=self._assertion_extraction_timeout(),
                 )
+            self._storage_bound = True
         except Exception:
             self._close_storage()
             raise
+        finally:
+            self._storage_binding = False
+
+    def _ensure_storage(self) -> None:
+        """Bind SQLite helpers on first use of a lazy clone."""
+        if self._storage_bound:
+            return
+        with self._storage_lock:
+            if self._storage_bound:
+                return
+            self._bind_storage(self._storage_db_path, self._storage_hermes_home)
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
+        state = object.__getattribute__(self, "__dict__")
         for attr in (
             "_adaptive_retrieval",
             "_store",
@@ -749,13 +809,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "_assertions",
             "_query_views",
         ):
-            helper = getattr(self, attr, None)
+            helper = state.get(attr)
             close = getattr(helper, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        state["_storage_bound"] = False
+        state["_storage_binding"] = False
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -773,8 +835,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.clear()
+        adaptive_retrieval = object.__getattribute__(self, "__dict__").get("_adaptive_retrieval")
+        if adaptive_retrieval is not None:
+            adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
         self._session_id = ""
         self._session_platform = ""
@@ -831,25 +894,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
-            current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
+            store = object.__getattribute__(self, "__dict__").get("_store")
+            current_store_home = str(getattr(store, "_hermes_home", "") or "")
             if current_home == str(hermes_home) and current_store_home == str(hermes_home):
                 return False
             self._hermes_home = hermes_home
-            store = getattr(self, "_store", None)
             if store is not None:
                 store._hermes_home = hermes_home
+            self._storage_hermes_home = hermes_home
             self._reset_profile_runtime_state()
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 
         db_path = self._resolve_db_path(hermes_home)
-        current_db = Path(getattr(getattr(self, "_store", None), "db_path", ""))
+        store = object.__getattribute__(self, "__dict__").get("_store")
+        current_db = Path(getattr(store, "db_path", ""))
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
 
+        was_bound = bool(object.__getattribute__(self, "__dict__").get("_storage_bound", False))
         self._close_storage()
         self._hermes_home = hermes_home
-        self._bind_storage(db_path, hermes_home)
+        if was_bound:
+            self._bind_storage(db_path, hermes_home)
+        else:
+            self._storage_db_path = db_path
+            self._storage_hermes_home = hermes_home
         self._reset_profile_runtime_state()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
@@ -6655,12 +6725,5 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+        self._storage_shutdown = True
+        self._close_storage()
