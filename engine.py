@@ -18,6 +18,7 @@ from collections import deque
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote
 
 from agent.context_engine import ContextEngine
 
@@ -145,6 +146,8 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+_STORAGE_QUICKCHECK_CACHE_LOCK = threading.RLock()
+_STORAGE_QUICKCHECK_CACHE: dict[str, tuple[bool, str]] = {}
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -423,6 +426,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_bound = False
         self._storage_binding = False
         self._storage_shutdown = False
+        self._storage_unavailable_reason = ""
         self._store = None
         self._dag = None
         self._lifecycle = None
@@ -730,6 +734,55 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return Path(hermes_home) / "lcm.db"
         return Path.home() / ".hermes" / "lcm.db"
 
+    @staticmethod
+    def _sqlite_readonly_uri(db_path: Path) -> str:
+        return f"file:{quote(str(db_path.resolve(strict=False)))}?mode=ro"
+
+    @classmethod
+    def _quick_check_storage(cls, db_path: Path) -> tuple[bool, str]:
+        """Return cached startup quick_check status for an existing SQLite DB.
+
+        Set ``LCM_SKIP_QUICKCHECK=1`` only for explicit repair tooling that must
+        inspect or rewrite a damaged ``lcm.db``. Normal plugin startup must keep
+        this guard enabled so LCM stays offline instead of opening write
+        connections against a corrupt database.
+        """
+        if os.environ.get("LCM_SKIP_QUICKCHECK") == "1":
+            return True, "skipped by LCM_SKIP_QUICKCHECK=1"
+        if str(db_path) == ":memory:" or not db_path.exists():
+            return True, "ok"
+
+        cache_key = str(db_path.resolve(strict=False))
+        with _STORAGE_QUICKCHECK_CACHE_LOCK:
+            cached = _STORAGE_QUICKCHECK_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        ok = False
+        detail = ""
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(cls._sqlite_readonly_uri(db_path), uri=True)
+            rows = conn.execute("PRAGMA quick_check").fetchall()
+            lines = [str(row[0]) for row in rows if row and row[0] is not None]
+            detail = "\n".join(lines[:3])
+            ok = bool(lines) and lines == ["ok"]
+            if not detail:
+                detail = "empty quick_check result"
+        except Exception as exc:
+            detail = str(exc) or exc.__class__.__name__
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        result = (ok, detail)
+        with _STORAGE_QUICKCHECK_CACHE_LOCK:
+            _STORAGE_QUICKCHECK_CACHE[cache_key] = result
+        return result
+
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
         db_path = Path(db_path)
@@ -737,6 +790,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_hermes_home = hermes_home
         if self._storage_bound:
             return
+        ok, detail = self._quick_check_storage(db_path)
+        if not ok:
+            first_lines = "; ".join(str(detail).splitlines()[:3]) or "unknown failure"
+            message = (
+                f"lcm.db failed quick_check: {first_lines} — plugin stays offline, "
+                "repair required (lcm-repair skill)"
+            )
+            self._storage_unavailable_reason = message
+            logger.critical(message)
+            raise RuntimeError(message)
+        self._storage_unavailable_reason = ""
         self._storage_shutdown = False
         self._storage_binding = True
         self._assertions = None
