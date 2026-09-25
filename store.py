@@ -65,8 +65,19 @@ _SIDECAR_VANISHED_MESSAGE = (
     "SQLite WAL sidecar vanished while connections are open — split-brain risk, "
     "restart required; reference issue #628"
 )
+_SIDECAR_IDENTITY_CHANGED_MESSAGE = (
+    "SQLite WAL sidecar identity changed while connections are open — split-brain risk, "
+    "restart required; reference issue #628"
+)
+_DB_IDENTITY_CHANGED_MESSAGE = (
+    "SQLite database file identity changed while connections are open — split-brain risk, "
+    "restart required; reference issue #628"
+)
+_DB_MISSING_MESSAGE = (
+    "SQLite database file missing while connections are open — split-brain risk, "
+    "restart required; reference issue #628"
+)
 _SIDECAR_SUFFIXES = ("-wal", "-shm")
-_SIDECAR_REPROBE_DELAY_SECONDS = 1.0
 _SIDECAR_INLINE_CHECK_INTERVAL_SECONDS = 1.0
 _SIDECAR_HEALTH_LOCK = threading.RLock()
 _SIDECAR_HEALTH_FAILURES: dict[str, str] = {}
@@ -77,7 +88,15 @@ def _sidecar_health_key(db_path: Path) -> str:
 
 
 def mark_sidecar_health_failed(db_path: str | Path, detail: str) -> str:
-    message = f"{_SIDECAR_VANISHED_MESSAGE}: {detail}"
+    if detail.startswith("missing database "):
+        prefix = _DB_MISSING_MESSAGE
+    elif detail.startswith("database "):
+        prefix = _DB_IDENTITY_CHANGED_MESSAGE
+    elif detail.startswith("sidecar identity changed "):
+        prefix = _SIDECAR_IDENTITY_CHANGED_MESSAGE
+    else:
+        prefix = _SIDECAR_VANISHED_MESSAGE
+    message = f"{prefix}: {detail}"
     key = _sidecar_health_key(Path(db_path))
     with _SIDECAR_HEALTH_LOCK:
         _SIDECAR_HEALTH_FAILURES[key] = message
@@ -400,6 +419,9 @@ class MessageStore:
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
+        self._keeper_conn: Optional[sqlite3.Connection] = None
+        # Back-compat for existing tests/introspection; the keeper is the
+        # process-lifetime connection that used to be called the sentinel.
         self._sentinel_conn: Optional[sqlite3.Connection] = None
         # ``self._conn`` is shared across threads (the connection is opened with
         # ``check_same_thread=False``). SQLite's own C-level mutex serializes
@@ -420,6 +442,8 @@ class MessageStore:
         self._write_lock = threading.RLock()
         self._contour_lock = threading.RLock()
         self._contour_ids: dict[str, tuple[int, int]] = {}
+        self._db_identity: tuple[int, int] | None = None
+        self._benign_missing_sidecars_warned: set[str] = set()
         self._last_inline_contour_check_at = 0.0
         self._init_db()
 
@@ -427,7 +451,35 @@ class MessageStore:
         failure = load_sidecar_health_failure(self.db_path)
         if failure:
             raise RuntimeError(failure)
+        db_identity_before_open = None
+        if not self._is_memory_database:
+            db_identity_before_open = self._identity_from_stat(os.stat(self.db_path))
+            self._db_identity = db_identity_before_open
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        if db_identity_before_open is not None:
+            try:
+                db_identity_after_open = self._identity_from_stat(os.stat(self.db_path))
+            except FileNotFoundError:
+                conn = self._conn
+                self._conn = None
+                conn.close()
+                detail = (
+                    f"missing database {self.db_path}; expected open database identity "
+                    f"dev={db_identity_before_open[0]} ino={db_identity_before_open[1]}"
+                )
+                message = self._mark_sidecar_health_failed(detail)
+                raise RuntimeError(message) from None
+            if db_identity_after_open != db_identity_before_open:
+                conn = self._conn
+                self._conn = None
+                conn.close()
+                detail = (
+                    f"database {self.db_path} identity changed while opening from "
+                    f"dev={db_identity_before_open[0]} ino={db_identity_before_open[1]} "
+                    f"to dev={db_identity_after_open[0]} ino={db_identity_after_open[1]}"
+                )
+                message = self._mark_sidecar_health_failed(detail)
+                raise RuntimeError(message)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         if not self._is_memory_database:
@@ -469,19 +521,36 @@ class MessageStore:
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
         self._conn.commit()
+        if not self._is_memory_database:
+            detail = self._db_identity_changed_detail()
+            if detail is not None:
+                conn = self._conn
+                self._conn = None
+                conn.close()
+                message = self._mark_sidecar_health_failed(detail)
+                raise RuntimeError(message)
         self._snapshot_existing_contour_ids()
-        self._ensure_sentinel_connection()
+        self._ensure_keeper_connection()
 
-    def _ensure_sentinel_connection(self) -> None:
-        if self._is_memory_database or self._sentinel_conn is not None:
+    def _ensure_keeper_connection(self) -> None:
+        if self._is_memory_database or self._keeper_conn is not None:
             return
         conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         try:
+            detail = self._db_identity_changed_detail()
+            if detail is not None:
+                message = self._mark_sidecar_health_failed(detail)
+                primary = self._conn
+                self._conn = None
+                if primary is not None:
+                    primary.close()
+                raise RuntimeError(message)
             refuse_schema_version_too_new(conn)
             configure_connection(conn)
         except Exception:
             conn.close()
             raise
+        self._keeper_conn = conn
         self._sentinel_conn = conn
 
     def _raise_if_sidecar_health_failed(self) -> None:
@@ -491,18 +560,10 @@ class MessageStore:
         self._check_sidecar_identity_inline()
 
     def check_sidecars_intact(self) -> bool:
-        if self._is_memory_database or self._conn is None:
+        if self._is_memory_database:
             return True
         with self._contour_lock:
             detail = self._check_sidecar_identities_locked()
-            if detail is None:
-                return True
-            if not detail.startswith("missing "):
-                message = self._mark_sidecar_health_failed(detail)
-                raise RuntimeError(message)
-        time.sleep(_SIDECAR_REPROBE_DELAY_SECONDS)
-        with self._contour_lock:
-            detail = self._check_sidecar_identities_locked(confirm_missing=True)
             if detail is None:
                 return True
         message = self._mark_sidecar_health_failed(detail)
@@ -515,6 +576,47 @@ class MessageStore:
     def _identity_from_stat(result: os.stat_result) -> tuple[int, int]:
         return (result.st_dev, result.st_ino)
 
+    def _has_open_database_connection(self) -> bool:
+        return (
+            getattr(self, "_conn", None) is not None
+            or getattr(self, "_keeper_conn", None) is not None
+            or getattr(self, "_sentinel_conn", None) is not None
+        )
+
+    def _snapshot_db_identity(self) -> None:
+        if self._is_memory_database:
+            return
+        self._db_identity = self._identity_from_stat(os.stat(self.db_path))
+
+    def _db_identity_changed_detail(self) -> str | None:
+        expected = self._db_identity
+        if expected is None:
+            self._snapshot_db_identity()
+            return None
+        try:
+            current = self._identity_from_stat(os.stat(self.db_path))
+        except FileNotFoundError:
+            return (
+                f"missing database {self.db_path}; open database identity was "
+                f"dev={expected[0]} ino={expected[1]}"
+            )
+        if current != expected:
+            return (
+                f"database {self.db_path} identity changed from dev={expected[0]} "
+                f"ino={expected[1]} to dev={current[0]} ino={current[1]}"
+            )
+        return None
+
+    def _warn_benign_sidecar_absence_once(self, detail: str) -> None:
+        if detail in self._benign_missing_sidecars_warned:
+            return
+        self._benign_missing_sidecars_warned.add(detail)
+        logger.warning(
+            "SQLite WAL sidecar missing with no open store connection; "
+            "continuing because SQLite will recreate sidecars on demand: %s",
+            detail,
+        )
+
     def _snapshot_existing_contour_ids(self) -> None:
         if self._is_memory_database:
             return
@@ -526,7 +628,11 @@ class MessageStore:
                     continue
                 self._contour_ids[suffix] = self._identity_from_stat(result)
 
-    def _check_sidecar_identities_locked(self, *, confirm_missing: bool = False) -> str | None:
+    def _check_sidecar_identities_locked(self) -> str | None:
+        db_detail = self._db_identity_changed_detail()
+        if db_detail is not None:
+            return db_detail
+        has_open_connection = self._has_open_database_connection()
         for suffix in _SIDECAR_SUFFIXES:
             path = self._sidecar_path(suffix)
             expected = self._contour_ids.get(suffix)
@@ -535,19 +641,23 @@ class MessageStore:
             except FileNotFoundError:
                 if expected is None:
                     continue
-                if confirm_missing:
-                    return f"missing {path}"
-                return f"missing {path}"
+                detail = f"missing sidecar {path}"
+                if has_open_connection:
+                    return detail
+                self._warn_benign_sidecar_absence_once(detail)
+                continue
 
             current = self._identity_from_stat(result)
             if expected is None:
                 self._contour_ids[suffix] = current
                 continue
             if current != expected:
-                return (
-                    f"{path} identity changed from dev={expected[0]} ino={expected[1]} "
-                    f"to dev={current[0]} ino={current[1]}"
-                )
+                if has_open_connection:
+                    return (
+                        f"sidecar identity changed {path} from dev={expected[0]} "
+                        f"ino={expected[1]} to dev={current[0]} ino={current[1]}"
+                    )
+                self._contour_ids[suffix] = current
         return None
 
     def _mark_sidecar_health_failed(self, detail: str) -> str:
@@ -572,23 +682,8 @@ class MessageStore:
             if now - self._last_inline_contour_check_at < _SIDECAR_INLINE_CHECK_INTERVAL_SECONDS:
                 return
             self._last_inline_contour_check_at = now
-            detail = self._check_sidecar_identities_locked(confirm_missing=True)
+            detail = self._check_sidecar_identities_locked()
         if detail is None:
-            return
-        if detail.startswith("missing "):
-            # A transient vanish (multi-process init can legitimately do this,
-            # strace-verified). NOTE: an already-open contour does NOT recreate
-            # the path file on subsequent writes — SQLite keeps writing through
-            # the orphaned fds, so this state does not self-heal. It stays a
-            # warning here: a single missing observation is not yet a second
-            # contour, and multi-process fresh init legitimately produces it.
-            # Confirmed escalation (re-probe) happens in check_sidecars_intact,
-            # driven by the periodic guard; an alien recreate is caught as an
-            # identity mismatch on the next inline check.
-            logger.warning(
-                "SQLite WAL sidecar temporarily missing while connections are "
-                "open: %s", detail,
-            )
             return
         message = self._mark_sidecar_health_failed(detail)
         raise RuntimeError(message)
@@ -1959,11 +2054,12 @@ class MessageStore:
 
     def shutdown(self) -> None:
         self.close()
-        sentinel = getattr(self, "_sentinel_conn", None)
-        if sentinel:
+        keeper = getattr(self, "_keeper_conn", None) or getattr(self, "_sentinel_conn", None)
+        if keeper:
             try:
-                sentinel.close()
+                keeper.close()
             finally:
+                self._keeper_conn = None
                 self._sentinel_conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup

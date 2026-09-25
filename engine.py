@@ -436,7 +436,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # down ALL helpers unconditionally — _close_storage is
                 # idempotent and cheap once torn down. _storage_shutdown (set
                 # by the listener/tick) routes MessageStore through shutdown()
-                # so the orphaned contour's sentinel is released too.
+                # so the orphaned contour's keeper is released too.
                 state["_storage_shutdown"] = True
                 self._close_storage()
                 raise RuntimeError(unavailable_reason)
@@ -1035,7 +1035,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             helper = state.get(attr)
             close = (
                 getattr(helper, "shutdown", None)
-                if state.get("_storage_shutdown", False) and attr == "_store"
+                if attr == "_store"
                 else getattr(helper, "close", None)
             )
             if callable(close):
