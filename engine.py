@@ -140,7 +140,12 @@ from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
 )
-from .store import MessageStore, load_sidecar_health_failure
+from .store import (
+    MessageStore,
+    add_contour_failure_listener,
+    load_sidecar_health_failure,
+    remove_contour_failure_listener,
+)
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -150,6 +155,24 @@ _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
 _STORAGE_QUICKCHECK_CACHE_LOCK = threading.RLock()
 _STORAGE_QUICKCHECK_CACHE: dict[str, tuple[bool, str]] = {}
 _SIDECAR_GUARD_INTERVAL_SECONDS = 30.0
+
+
+def _make_contour_failure_listener(engine: "LCMEngine") -> Callable[[str], None]:
+    """Weak listener: confirmed store contour failure -> engine fuse flags.
+
+    Cheap and non-blocking by contract (runs on write/check paths): it only
+    sets fuse state. Actual teardown happens on the next lazy-attribute access
+    (__getattribute__ fuse branch) or the next guard tick, whichever first.
+    """
+    engine_ref = weakref.ref(engine)
+
+    def listener(db_key: str) -> None:
+        instance = engine_ref()
+        if instance is None:
+            return
+        instance._on_contour_failure_notification(db_key)
+
+    return listener
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -409,6 +432,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             state = object.__getattribute__(self, "__dict__")
             unavailable_reason = state.get("_storage_unavailable_reason", "")
             if unavailable_reason:
+                # Fuse tripped (contour-failure listener or guard tick). Tear
+                # down ALL helpers unconditionally — _close_storage is
+                # idempotent and cheap once torn down. _storage_shutdown (set
+                # by the listener/tick) routes MessageStore through shutdown()
+                # so the orphaned contour's sentinel is released too.
+                state["_storage_shutdown"] = True
+                self._close_storage()
                 raise RuntimeError(unavailable_reason)
             if (
                 "_storage_lock" in state
@@ -435,6 +465,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._sidecar_guard_timer: threading.Timer | None = None
         self._sidecar_guard_stopped = threading.Event()
         self._sidecar_guard_lock = threading.RLock()
+        self._contour_failure_listener_token: int | None = None
         self._store = None
         self._dag = None
         self._lifecycle = None
@@ -860,6 +891,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     timeout_seconds=self._assertion_extraction_timeout(),
                 )
             self._storage_bound = True
+            self._contour_failure_listener_token = add_contour_failure_listener(
+                _make_contour_failure_listener(self)
+            )
             self._schedule_sidecar_guard()
         except Exception:
             self._close_storage()
@@ -953,9 +987,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return
             self._bind_storage(self._storage_db_path, self._storage_hermes_home)
 
+    def _on_contour_failure_notification(self, db_key: str) -> None:
+        """Fuse flags from a confirmed store contour failure. Non-blocking.
+
+        Runs synchronously on the detecting write/check path, possibly while
+        that path holds store locks — so this must only set state. Teardown is
+        deferred to the next lazy-attribute access or guard tick.
+        """
+        state = object.__getattribute__(self, "__dict__")
+        if state.get("_storage_shutdown", False):
+            return
+        db_path = state.get("_storage_db_path")
+        if db_path is None:
+            return
+        if str(Path(db_path).resolve(strict=False)) != db_key:
+            return
+        reason = load_sidecar_health_failure(db_path) or "LCM storage contour failure"
+        state["_storage_unavailable_reason"] = reason
+        state["_storage_shutdown"] = True
+        state["_storage_bound"] = False
+
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
         state = object.__getattribute__(self, "__dict__")
+        remove_contour_failure_listener(state.get("_contour_failure_listener_token"))
+        state["_contour_failure_listener_token"] = None
         lock = state.get("_sidecar_guard_lock")
         if lock is None:
             lock = threading.RLock()

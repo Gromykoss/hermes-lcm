@@ -235,6 +235,33 @@ class TestGracefulClose:
         with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
             engine._dag.add_node(SummaryNode(session_id="sess", summary="blocked"))
 
+    def test_inline_confirmed_failure_trips_engine_fuse_immediately(self, tmp_path: Path):
+        db = tmp_path / "engine.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+        store = engine._store
+        dag = engine._dag
+        wal = Path(str(db) + "-wal")
+        engine._store.append("sess", {"role": "user", "content": "hello"})
+
+        wal.unlink()
+        wal.write_bytes(b"alien contour")
+        store._last_inline_contour_check_at = 0.0
+
+        with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+            store.append("sess", {"role": "user", "content": "blocked"})
+
+        # The contour-failure listener tripped the engine fuse synchronously:
+        # the very next lazy-attribute access tears down ALL helpers (not just
+        # MessageStore) and refuses — no 30s window for DAG/lifecycle writes.
+        assert engine._storage_unavailable_reason
+        assert engine._storage_bound is False
+        with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+            engine._dag.add_node(SummaryNode(session_id="sess", summary="blocked"))
+        assert store._sentinel_conn is None
+        # dag was resolved BEFORE the fuse tripped: the teardown must have
+        # closed its connection (the same instance, now unusable).
+        assert dag._conn is None
+
     def test_write_path_rate_limited_restat_detects_alien_wal(self, tmp_path: Path):
         db = tmp_path / "store.db"
         wal = Path(str(db) + "-wal")

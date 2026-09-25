@@ -78,14 +78,52 @@ def _sidecar_health_key(db_path: Path) -> str:
 
 def mark_sidecar_health_failed(db_path: str | Path, detail: str) -> str:
     message = f"{_SIDECAR_VANISHED_MESSAGE}: {detail}"
+    key = _sidecar_health_key(Path(db_path))
     with _SIDECAR_HEALTH_LOCK:
-        _SIDECAR_HEALTH_FAILURES[_sidecar_health_key(Path(db_path))] = message
+        _SIDECAR_HEALTH_FAILURES[key] = message
+    # Deliberately OUTSIDE the health lock: listeners may take engine/store
+    # locks; taking them while holding the registry lock could deadlock
+    # against a tick path that walks locks in the opposite order.
+    _notify_contour_failure_listeners(key)
     return message
 
 
 def load_sidecar_health_failure(db_path: str | Path) -> str:
     with _SIDECAR_HEALTH_LOCK:
         return _SIDECAR_HEALTH_FAILURES.get(_sidecar_health_key(Path(db_path)), "")
+
+
+_CONTOUR_FAILURE_LISTENERS: dict[int, Callable[[str], None]] = {}
+
+
+def add_contour_failure_listener(listener: Callable[[str], None]) -> int:
+    """Register a callback fired when a contour failure is confirmed.
+
+    The callback receives the resolved db-path key. It must be cheap and
+    non-blocking (it runs synchronously on the detecting write/check path);
+    expensive teardown belongs in a follow-up step by the owner.
+    """
+    with _SIDECAR_HEALTH_LOCK:
+        token = max(_CONTOUR_FAILURE_LISTENERS, default=0) + 1
+        _CONTOUR_FAILURE_LISTENERS[token] = listener
+        return token
+
+
+def remove_contour_failure_listener(token: int | None) -> None:
+    if token is None:
+        return
+    with _SIDECAR_HEALTH_LOCK:
+        _CONTOUR_FAILURE_LISTENERS.pop(token, None)
+
+
+def _notify_contour_failure_listeners(key: str) -> None:
+    with _SIDECAR_HEALTH_LOCK:
+        listeners = list(_CONTOUR_FAILURE_LISTENERS.values())
+    for listener in listeners:
+        try:
+            listener(key)
+        except Exception:
+            logger.exception("contour failure listener raised")
 
 
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
@@ -520,10 +558,12 @@ class MessageStore:
     def _check_sidecar_identity_inline(self) -> None:
         if self._is_memory_database or self._conn is None:
             return
-        # wall-clock time, NOT time.monotonic(): the 1s rate limit does not need
-        # monotonicity, and callers (tests) may patch the global monotonic clock
-        # — extra monotonic() calls from the write path would silently shift
-        # their counters and change their timing behavior.
+        # wall-clock time, NOT time.monotonic(): callers (tests) may patch the
+        # global monotonic clock, and extra monotonic() calls from the write
+        # path would silently shift their counters and change timing behavior.
+        # Trade-off: a backward wall-clock step suppresses inline checks for
+        # the step's length; the engine guard timer stays monotonic, so a
+        # standalone store only widens that (already warning-only) window.
         now = time.time()
         if now - self._last_inline_contour_check_at < _SIDECAR_INLINE_CHECK_INTERVAL_SECONDS:
             return
@@ -537,10 +577,14 @@ class MessageStore:
             return
         if detail.startswith("missing "):
             # A transient vanish (multi-process init can legitimately do this,
-            # strace-verified). SQLite recreates sidecars on the next contour
-            # write; an alien recreate is caught as an identity mismatch on the
-            # next inline check. A persistently missing contour is confirmed by
-            # the periodic guard's re-probe, never by one inline observation.
+            # strace-verified). NOTE: an already-open contour does NOT recreate
+            # the path file on subsequent writes — SQLite keeps writing through
+            # the orphaned fds, so this state does not self-heal. It stays a
+            # warning here: a single missing observation is not yet a second
+            # contour, and multi-process fresh init legitimately produces it.
+            # Confirmed escalation (re-probe) happens in check_sidecars_intact,
+            # driven by the periodic guard; an alien recreate is caught as an
+            # identity mismatch on the next inline check.
             logger.warning(
                 "SQLite WAL sidecar temporarily missing while connections are "
                 "open: %s", detail,
