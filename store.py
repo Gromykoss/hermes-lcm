@@ -520,11 +520,15 @@ class MessageStore:
     def _check_sidecar_identity_inline(self) -> None:
         if self._is_memory_database or self._conn is None:
             return
-        now = time.monotonic()
+        # wall-clock time, NOT time.monotonic(): the 1s rate limit does not need
+        # monotonicity, and callers (tests) may patch the global monotonic clock
+        # — extra monotonic() calls from the write path would silently shift
+        # their counters and change their timing behavior.
+        now = time.time()
         if now - self._last_inline_contour_check_at < _SIDECAR_INLINE_CHECK_INTERVAL_SECONDS:
             return
         with self._contour_lock:
-            now = time.monotonic()
+            now = time.time()
             if now - self._last_inline_contour_check_at < _SIDECAR_INLINE_CHECK_INTERVAL_SECONDS:
                 return
             self._last_inline_contour_check_at = now
