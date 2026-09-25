@@ -61,6 +61,30 @@ from .tokens import count_message_tokens
 logger = logging.getLogger(__name__)
 
 
+_SIDECAR_VANISHED_MESSAGE = (
+    "SQLite WAL sidecar vanished while connections are open — split-brain risk, "
+    "restart required; reference issue #628"
+)
+_SIDECAR_HEALTH_LOCK = threading.RLock()
+_SIDECAR_HEALTH_FAILURES: dict[str, str] = {}
+
+
+def _sidecar_health_key(db_path: Path) -> str:
+    return str(db_path.resolve(strict=False))
+
+
+def mark_sidecar_health_failed(db_path: str | Path, detail: str) -> str:
+    message = f"{_SIDECAR_VANISHED_MESSAGE}: {detail}"
+    with _SIDECAR_HEALTH_LOCK:
+        _SIDECAR_HEALTH_FAILURES[_sidecar_health_key(Path(db_path))] = message
+    return message
+
+
+def load_sidecar_health_failure(db_path: str | Path) -> str:
+    with _SIDECAR_HEALTH_LOCK:
+        return _SIDECAR_HEALTH_FAILURES.get(_sidecar_health_key(Path(db_path)), "")
+
+
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
@@ -335,6 +359,7 @@ class MessageStore:
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
+        self._sentinel_conn: Optional[sqlite3.Connection] = None
         # ``self._conn`` is shared across threads (the connection is opened with
         # ``check_same_thread=False``). SQLite's own C-level mutex serializes
         # statements at the engine layer, but the Python ``sqlite3`` module
@@ -355,6 +380,9 @@ class MessageStore:
         self._init_db()
 
     def _init_db(self):
+        failure = load_sidecar_health_failure(self.db_path)
+        if failure:
+            raise RuntimeError(failure)
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
@@ -397,6 +425,40 @@ class MessageStore:
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
         self._conn.commit()
+        self._ensure_sentinel_connection()
+        self.check_sidecars_intact()
+
+    def _ensure_sentinel_connection(self) -> None:
+        if self._is_memory_database or self._sentinel_conn is not None:
+            return
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        try:
+            refuse_schema_version_too_new(conn)
+            configure_connection(conn)
+        except Exception:
+            conn.close()
+            raise
+        self._sentinel_conn = conn
+
+    def _raise_if_sidecar_health_failed(self) -> None:
+        failure = load_sidecar_health_failure(self.db_path)
+        if failure:
+            raise RuntimeError(failure)
+
+    def check_sidecars_intact(self) -> bool:
+        if self._is_memory_database or self._conn is None:
+            return True
+        missing = [
+            suffix
+            for suffix in ("-wal", "-shm")
+            if not os.path.isfile(str(self.db_path) + suffix)
+        ]
+        if not missing:
+            return True
+        detail = f"missing {', '.join(str(self.db_path) + suffix for suffix in missing)}"
+        message = mark_sidecar_health_failed(self.db_path, detail)
+        logger.error(message)
+        raise RuntimeError(message)
 
     def _ensure_source_column(self) -> None:
         columns = {
@@ -472,6 +534,7 @@ class MessageStore:
         ingested_at = time.time()
 
         with self._write_lock:
+            self._raise_if_sidecar_health_failed()
             cur = self._conn.execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
@@ -535,6 +598,7 @@ class MessageStore:
 
         ids = []
         with self._write_lock, self._conn:
+            self._raise_if_sidecar_health_failed()
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
@@ -571,6 +635,7 @@ class MessageStore:
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
         with self._write_lock:
+            self._raise_if_sidecar_health_failed()
             cur = self._conn.execute(
                 "UPDATE messages SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
@@ -581,6 +646,7 @@ class MessageStore:
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         with self._write_lock:
+            self._raise_if_sidecar_health_failed()
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
@@ -606,6 +672,7 @@ class MessageStore:
         offsets, returning a garbled fragment (F2).
         """
         with self._write_lock:
+            self._raise_if_sidecar_health_failed()
             row = self._conn.execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
@@ -635,6 +702,7 @@ class MessageStore:
 
         """Mark a message as pinned (protected from pruning)."""
         with self._write_lock:
+            self._raise_if_sidecar_health_failed()
             self._conn.execute(
                 "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
             )
@@ -642,6 +710,7 @@ class MessageStore:
 
     def unpin(self, store_id: int) -> None:
         with self._write_lock:
+            self._raise_if_sidecar_health_failed()
             self._conn.execute(
                 "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
             )
@@ -1041,6 +1110,7 @@ class MessageStore:
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
         with self._write_lock, self._conn:
+            self._raise_if_sidecar_health_failed()
             cur = self._conn.execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),
@@ -1110,6 +1180,7 @@ class MessageStore:
             return False
         wrote = False
         with self._write_lock:
+            self._raise_if_sidecar_health_failed()
             for key in keys:
                 if skip_unchanged:
                     existing = conn.execute(
@@ -1168,6 +1239,7 @@ class MessageStore:
 
         key = self._compaction_telemetry_key(conversation_id)
         with self._write_lock:
+            self._raise_if_sidecar_health_failed()
             try:
                 # Separate MessageStore instances have separate Python locks.
                 # Acquire SQLite's write reservation before reading so this
@@ -1752,8 +1824,17 @@ class MessageStore:
             conn.close()
             self._conn = None
 
+    def shutdown(self) -> None:
+        self.close()
+        sentinel = getattr(self, "_sentinel_conn", None)
+        if sentinel:
+            try:
+                sentinel.close()
+            finally:
+                self._sentinel_conn = None
+
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
-            self.close()
+            self.shutdown()
         except Exception:
             pass

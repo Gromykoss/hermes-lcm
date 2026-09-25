@@ -17,11 +17,14 @@ from pathlib import Path
 
 import pytest
 
+import hermes_lcm.engine as lcm_engine
 from hermes_lcm.db_bootstrap import (
     configure_connection,
     ensure_message_origin_columns,
 )
+from hermes_lcm.config import LCMConfig
 from hermes_lcm.store import MessageStore
+from hermes_lcm.engine import LCMEngine
 from hermes_lcm.dag import SummaryDAG
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 
@@ -107,19 +110,99 @@ class TestGracefulClose:
         store.append("sess", {"role": "user", "content": "hello"})
         assert db.exists()
         store.close()
-        # After close the WAL should be small or non-existent (all frames
-        # checkpointed by the passive call).
-        wal_size = self._write_and_get_wal_size(db)
-        assert wal_size < 4096, (
-            f"WAL still {wal_size} bytes after MessageStore.close(); "
-            "checkpoint may not have run"
-        )
+        # The sentinel intentionally keeps WAL sidecars present after close();
+        # the invariant is that the database remains readable and healthy.
+        assert Path(str(db) + "-wal").is_file()
+        assert Path(str(db) + "-shm").is_file()
+        with sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True) as conn:
+            assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        store.shutdown()
 
     def test_message_store_close_is_idempotent(self, tmp_path: Path):
         db = tmp_path / "store.db"
         store = MessageStore(db)
         store.close()
         store.close()  # should not raise
+
+    def test_sentinel_holds_contour(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        wal = Path(str(db) + "-wal")
+        shm = Path(str(db) + "-shm")
+
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+        before = (wal.stat().st_ino, shm.stat().st_ino)
+
+        store.close()
+
+        assert wal.is_file()
+        assert shm.is_file()
+        assert (wal.stat().st_ino, shm.stat().st_ino) == before
+
+        reopened = MessageStore(db)
+        try:
+            assert wal.is_file()
+            assert shm.is_file()
+            assert (wal.stat().st_ino, shm.stat().st_ino) == before
+        finally:
+            reopened.shutdown()
+            store.shutdown()
+
+    def test_sidecar_vanish_detector(self, tmp_path: Path, caplog):
+        db = tmp_path / "store.db"
+        wal = Path(str(db) + "-wal")
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+
+        wal.unlink()
+
+        with caplog.at_level("ERROR"):
+            with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+                store.check_sidecars_intact()
+
+        assert "split-brain risk, restart required; reference issue #628" in caplog.text
+        with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+            store.append("sess", {"role": "user", "content": "blocked"})
+
+        lcm_engine._STORAGE_QUICKCHECK_CACHE.clear()
+        with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+            LCMEngine(config=LCMConfig(database_path=str(db)))
+
+        store.shutdown()
+
+    def test_reset_closes_sentinel(self, tmp_path: Path):
+        fd_dir = Path("/proc/self/fd")
+        if not fd_dir.exists():
+            pytest.skip("fd inspection is Linux-specific")
+
+        def open_fds_for(path: Path) -> list[str]:
+            result = []
+            resolved = str(path)
+            for fd in fd_dir.iterdir():
+                try:
+                    target = fd.resolve(strict=False)
+                except OSError:
+                    continue
+                if str(target).startswith(resolved):
+                    result.append(str(target))
+            return result
+
+        db = tmp_path / "store.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+        engine._store.append("sess", {"role": "user", "content": "before reset"})
+        assert open_fds_for(db)
+
+        engine.shutdown()
+
+        assert open_fds_for(db) == []
+        for path in (db, Path(str(db) + "-wal"), Path(str(db) + "-shm")):
+            path.unlink(missing_ok=True)
+
+        reopened = LCMEngine(config=LCMConfig(database_path=str(db)))
+        try:
+            assert reopened._store.get_session_count("sess") == 0
+        finally:
+            reopened.shutdown()
 
     # -- SummaryDAG ---------------------------------------------------------
 

@@ -14,6 +14,7 @@ import re
 import sqlite3
 import threading
 import time
+import weakref
 from collections import deque
 import uuid
 from pathlib import Path
@@ -139,7 +140,7 @@ from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
 )
-from .store import MessageStore
+from .store import MessageStore, load_sidecar_health_failure
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -148,6 +149,7 @@ logger = logging.getLogger(__name__)
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
 _STORAGE_QUICKCHECK_CACHE_LOCK = threading.RLock()
 _STORAGE_QUICKCHECK_CACHE: dict[str, tuple[bool, str]] = {}
+_SIDECAR_GUARD_INTERVAL_SECONDS = 30.0
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -427,6 +429,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_binding = False
         self._storage_shutdown = False
         self._storage_unavailable_reason = ""
+        self._sidecar_guard_timer: threading.Timer | None = None
+        self._sidecar_guard_stopped = threading.Event()
         self._store = None
         self._dag = None
         self._lifecycle = None
@@ -790,6 +794,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_hermes_home = hermes_home
         if self._storage_bound:
             return
+        sidecar_failure = load_sidecar_health_failure(db_path)
+        if sidecar_failure:
+            self._storage_unavailable_reason = sidecar_failure
+            logger.critical(sidecar_failure)
+            raise RuntimeError(sidecar_failure)
         ok, detail = self._quick_check_storage(db_path)
         if not ok:
             first_lines = "; ".join(str(detail).splitlines()[:3]) or "unknown failure"
@@ -846,12 +855,56 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     model=self._assertion_extraction_model(),
                     timeout_seconds=self._assertion_extraction_timeout(),
                 )
+            self._store.check_sidecars_intact()
             self._storage_bound = True
+            self._schedule_sidecar_guard()
         except Exception:
             self._close_storage()
             raise
         finally:
             self._storage_binding = False
+
+    def _schedule_sidecar_guard(self) -> None:
+        state = object.__getattribute__(self, "__dict__")
+        old_timer = state.get("_sidecar_guard_timer")
+        if old_timer is not None:
+            old_timer.cancel()
+        if state.get("_storage_shutdown", False):
+            return
+        stopped = state.get("_sidecar_guard_stopped")
+        if stopped is None:
+            stopped = threading.Event()
+            state["_sidecar_guard_stopped"] = stopped
+        stopped.clear()
+        timer = threading.Timer(
+            _SIDECAR_GUARD_INTERVAL_SECONDS,
+            LCMEngine._sidecar_guard_tick_for_ref,
+            args=(weakref.ref(self),),
+        )
+        timer.daemon = True
+        state["_sidecar_guard_timer"] = timer
+        timer.start()
+
+    @staticmethod
+    def _sidecar_guard_tick_for_ref(engine_ref: weakref.ReferenceType["LCMEngine"]) -> None:
+        engine = engine_ref()
+        if engine is not None:
+            engine._sidecar_guard_tick()
+
+    def _sidecar_guard_tick(self) -> None:
+        state = object.__getattribute__(self, "__dict__")
+        if state.get("_storage_shutdown", False):
+            return
+        store = state.get("_store")
+        if store is not None and state.get("_storage_bound", False):
+            try:
+                store.check_sidecars_intact()
+            except RuntimeError as exc:
+                state["_storage_unavailable_reason"] = str(exc)
+                return
+            except Exception:
+                logger.exception("LCM sidecar guard failed unexpectedly")
+        self._schedule_sidecar_guard()
 
     def _ensure_storage(self) -> None:
         """Bind SQLite helpers on first use of a lazy clone."""
@@ -865,6 +918,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
         state = object.__getattribute__(self, "__dict__")
+        timer = state.get("_sidecar_guard_timer")
+        if timer is not None:
+            timer.cancel()
+            state["_sidecar_guard_timer"] = None
+        stopped = state.get("_sidecar_guard_stopped")
+        if stopped is not None:
+            stopped.set()
         for attr in (
             "_adaptive_retrieval",
             "_store",
@@ -874,7 +934,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "_query_views",
         ):
             helper = state.get(attr)
-            close = getattr(helper, "close", None)
+            close = (
+                getattr(helper, "shutdown", None)
+                if state.get("_storage_shutdown", False) and attr == "_store"
+                else getattr(helper, "close", None)
+            )
             if callable(close):
                 try:
                     close()
