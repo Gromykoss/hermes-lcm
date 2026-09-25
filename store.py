@@ -529,9 +529,21 @@ class MessageStore:
                 return
             self._last_inline_contour_check_at = now
             detail = self._check_sidecar_identities_locked(confirm_missing=True)
-        if detail is not None:
-            message = self._mark_sidecar_health_failed(detail)
-            raise RuntimeError(message)
+        if detail is None:
+            return
+        if detail.startswith("missing "):
+            # A transient vanish (multi-process init can legitimately do this,
+            # strace-verified). SQLite recreates sidecars on the next contour
+            # write; an alien recreate is caught as an identity mismatch on the
+            # next inline check. A persistently missing contour is confirmed by
+            # the periodic guard's re-probe, never by one inline observation.
+            logger.warning(
+                "SQLite WAL sidecar temporarily missing while connections are "
+                "open: %s", detail,
+            )
+            return
+        message = self._mark_sidecar_health_failed(detail)
+        raise RuntimeError(message)
 
     def _ensure_source_column(self) -> None:
         columns = {

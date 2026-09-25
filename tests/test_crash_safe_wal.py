@@ -251,6 +251,28 @@ class TestGracefulClose:
         finally:
             store.shutdown()
 
+    def test_write_path_inline_tolerates_transient_missing_sidecar(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        shm = Path(str(db) + "-shm")
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+
+        shm.unlink()
+        store._last_inline_contour_check_at = 0.0
+
+        try:
+            # A single inline observation of a missing sidecar is a transient
+            # state (multi-process init), not a confirmed split-brain: the
+            # write proceeds. SQLite keeps writing through the already-open
+            # contour fds and does NOT recreate the path file; if another
+            # process recreates it (alien contour), the identity check raises
+            # on a later write. Persistently missing contours are confirmed by
+            # the periodic guard's re-probe.
+            store.append("sess", {"role": "user", "content": "again"})
+            assert not shm.exists()
+        finally:
+            store.shutdown()
+
     def test_reset_closes_sentinel(self, tmp_path: Path):
         fd_dir = Path("/proc/self/fd")
         if not fd_dir.exists():
