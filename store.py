@@ -65,6 +65,9 @@ _SIDECAR_VANISHED_MESSAGE = (
     "SQLite WAL sidecar vanished while connections are open — split-brain risk, "
     "restart required; reference issue #628"
 )
+_SIDECAR_SUFFIXES = ("-wal", "-shm")
+_SIDECAR_REPROBE_DELAY_SECONDS = 1.0
+_SIDECAR_INLINE_CHECK_INTERVAL_SECONDS = 1.0
 _SIDECAR_HEALTH_LOCK = threading.RLock()
 _SIDECAR_HEALTH_FAILURES: dict[str, str] = {}
 
@@ -377,6 +380,9 @@ class MessageStore:
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
         self._write_lock = threading.RLock()
+        self._contour_lock = threading.RLock()
+        self._contour_ids: dict[str, tuple[int, int]] = {}
+        self._last_inline_contour_check_at = 0.0
         self._init_db()
 
     def _init_db(self):
@@ -425,8 +431,8 @@ class MessageStore:
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
         self._conn.commit()
+        self._snapshot_existing_contour_ids()
         self._ensure_sentinel_connection()
-        self.check_sidecars_intact()
 
     def _ensure_sentinel_connection(self) -> None:
         if self._is_memory_database or self._sentinel_conn is not None:
@@ -444,21 +450,88 @@ class MessageStore:
         failure = load_sidecar_health_failure(self.db_path)
         if failure:
             raise RuntimeError(failure)
+        self._check_sidecar_identity_inline()
 
     def check_sidecars_intact(self) -> bool:
         if self._is_memory_database or self._conn is None:
             return True
-        missing = [
-            suffix
-            for suffix in ("-wal", "-shm")
-            if not os.path.isfile(str(self.db_path) + suffix)
-        ]
-        if not missing:
-            return True
-        detail = f"missing {', '.join(str(self.db_path) + suffix for suffix in missing)}"
+        with self._contour_lock:
+            detail = self._check_sidecar_identities_locked()
+            if detail is None:
+                return True
+            if not detail.startswith("missing "):
+                message = self._mark_sidecar_health_failed(detail)
+                raise RuntimeError(message)
+        time.sleep(_SIDECAR_REPROBE_DELAY_SECONDS)
+        with self._contour_lock:
+            detail = self._check_sidecar_identities_locked(confirm_missing=True)
+            if detail is None:
+                return True
+        message = self._mark_sidecar_health_failed(detail)
+        raise RuntimeError(message)
+
+    def _sidecar_path(self, suffix: str) -> Path:
+        return Path(str(self.db_path) + suffix)
+
+    @staticmethod
+    def _identity_from_stat(result: os.stat_result) -> tuple[int, int]:
+        return (result.st_dev, result.st_ino)
+
+    def _snapshot_existing_contour_ids(self) -> None:
+        if self._is_memory_database:
+            return
+        with self._contour_lock:
+            for suffix in _SIDECAR_SUFFIXES:
+                try:
+                    result = os.stat(self._sidecar_path(suffix))
+                except FileNotFoundError:
+                    continue
+                self._contour_ids[suffix] = self._identity_from_stat(result)
+
+    def _check_sidecar_identities_locked(self, *, confirm_missing: bool = False) -> str | None:
+        for suffix in _SIDECAR_SUFFIXES:
+            path = self._sidecar_path(suffix)
+            expected = self._contour_ids.get(suffix)
+            try:
+                result = os.stat(path)
+            except FileNotFoundError:
+                if expected is None:
+                    continue
+                if confirm_missing:
+                    return f"missing {path}"
+                return f"missing {path}"
+
+            current = self._identity_from_stat(result)
+            if expected is None:
+                self._contour_ids[suffix] = current
+                continue
+            if current != expected:
+                return (
+                    f"{path} identity changed from dev={expected[0]} ino={expected[1]} "
+                    f"to dev={current[0]} ino={current[1]}"
+                )
+        return None
+
+    def _mark_sidecar_health_failed(self, detail: str) -> str:
         message = mark_sidecar_health_failed(self.db_path, detail)
         logger.error(message)
-        raise RuntimeError(message)
+        return message
+
+    def _check_sidecar_identity_inline(self) -> None:
+        if self._is_memory_database or self._conn is None:
+            return
+        now = time.monotonic()
+        if now - self._last_inline_contour_check_at < _SIDECAR_INLINE_CHECK_INTERVAL_SECONDS:
+            return
+        with self._contour_lock:
+            now = time.monotonic()
+            if now - self._last_inline_contour_check_at < _SIDECAR_INLINE_CHECK_INTERVAL_SECONDS:
+                return
+            self._last_inline_contour_check_at = now
+            detail = self._check_sidecar_identities_locked(confirm_missing=True)
+        if detail is not None:
+            message = self._mark_sidecar_health_failed(detail)
+            raise RuntimeError(message)
 
     def _ensure_source_column(self) -> None:
         columns = {

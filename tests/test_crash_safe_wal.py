@@ -25,7 +25,7 @@ from hermes_lcm.db_bootstrap import (
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.store import MessageStore
 from hermes_lcm.engine import LCMEngine
-from hermes_lcm.dag import SummaryDAG
+from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 
 
@@ -131,24 +131,33 @@ class TestGracefulClose:
 
         store = MessageStore(db)
         store.append("sess", {"role": "user", "content": "hello"})
-        before = (wal.stat().st_ino, shm.stat().st_ino)
+        before = (
+            (wal.stat().st_dev, wal.stat().st_ino),
+            (shm.stat().st_dev, shm.stat().st_ino),
+        )
 
         store.close()
 
         assert wal.is_file()
         assert shm.is_file()
-        assert (wal.stat().st_ino, shm.stat().st_ino) == before
+        assert (
+            (wal.stat().st_dev, wal.stat().st_ino),
+            (shm.stat().st_dev, shm.stat().st_ino),
+        ) == before
 
         reopened = MessageStore(db)
         try:
             assert wal.is_file()
             assert shm.is_file()
-            assert (wal.stat().st_ino, shm.stat().st_ino) == before
+            assert (
+                (wal.stat().st_dev, wal.stat().st_ino),
+                (shm.stat().st_dev, shm.stat().st_ino),
+            ) == before
         finally:
             reopened.shutdown()
             store.shutdown()
 
-    def test_sidecar_vanish_detector(self, tmp_path: Path, caplog):
+    def test_sidecar_missing_after_reprobe_detector(self, tmp_path: Path, caplog):
         db = tmp_path / "store.db"
         wal = Path(str(db) + "-wal")
         store = MessageStore(db)
@@ -169,6 +178,78 @@ class TestGracefulClose:
             LCMEngine(config=LCMConfig(database_path=str(db)))
 
         store.shutdown()
+
+    def test_sidecar_alien_recreate_detector(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        shm = Path(str(db) + "-shm")
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+
+        shm.unlink()
+        shm.write_bytes(b"alien contour")
+
+        try:
+            with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+                store.check_sidecars_intact()
+        finally:
+            store.shutdown()
+
+    def test_sidecar_check_is_noop_before_contour_materializes(self, tmp_path: Path):
+        db = tmp_path / "fresh.db"
+        store = MessageStore.__new__(MessageStore)
+        store.db_path = db
+        store._is_memory_database = False
+        store._conn = sqlite3.connect(str(db))
+        store._contour_lock = threading.RLock()
+        store._contour_ids = {}
+        try:
+            configure_connection(store._conn)
+            assert not Path(str(db) + "-wal").exists()
+            assert not Path(str(db) + "-shm").exists()
+            assert store.check_sidecars_intact() is True
+        finally:
+            store._conn.close()
+
+    def test_engine_guard_closes_helpers_and_refuses_dag_after_confirmed_sidecar_failure(
+        self,
+        tmp_path: Path,
+    ):
+        db = tmp_path / "engine.db"
+        shm = Path(str(db) + "-shm")
+        engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+        store = engine._store
+        dag = engine._dag
+        engine._store.append("sess", {"role": "user", "content": "hello"})
+
+        shm.unlink()
+        shm.write_bytes(b"alien contour")
+        engine._sidecar_guard_tick()
+
+        assert engine._storage_unavailable_reason
+        assert engine._storage_bound is False
+        assert store._conn is None
+        assert store._sentinel_conn is None
+        assert dag._conn is None
+        with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+            engine._ensure_storage()
+        with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+            engine._dag.add_node(SummaryNode(session_id="sess", summary="blocked"))
+
+    def test_write_path_rate_limited_restat_detects_alien_wal(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        wal = Path(str(db) + "-wal")
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+
+        wal.unlink()
+        wal.write_bytes(b"alien contour")
+        store._last_inline_contour_check_at = 0.0
+
+        try:
+            with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+                store.append("sess", {"role": "user", "content": "blocked"})
+        finally:
+            store.shutdown()
 
     def test_reset_closes_sentinel(self, tmp_path: Path):
         fd_dir = Path("/proc/self/fd")

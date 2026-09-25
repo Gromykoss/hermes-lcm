@@ -642,10 +642,11 @@ split-brain risk and can corrupt pages (issue #628).
 
 LCM keeps one sentinel SQLite connection open for the `MessageStore` lifetime so
 ordinary `Store.close()` calls do not create last-close windows inside a running
-process. It also checks that `lcm.db-wal` and `lcm.db-shm` remain present while
-connections are open; if either sidecar vanishes, LCM logs an error, marks the
-store unhealthy, refuses further writes/binds in that process, and requires a
-restart. It does not attempt automatic repair.
+process. It also checks that `lcm.db-wal` and `lcm.db-shm` keep the same file
+identity while connections are open; if either sidecar is confirmed missing or
+recreated at the same path, LCM logs an error, marks the store unhealthy, closes
+storage helpers, refuses further reads/writes/binds in that process, and requires
+a restart. It does not attempt automatic repair.
 
 For read-only diagnostics on a live path, open SQLite with
 `file:/path/to/lcm.db?mode=ro&immutable=1` so inspection does not participate in

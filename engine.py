@@ -407,6 +407,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def __getattribute__(self, name: str) -> Any:
         if name in object.__getattribute__(self, "_LAZY_STORAGE_ATTRS"):
             state = object.__getattribute__(self, "__dict__")
+            unavailable_reason = state.get("_storage_unavailable_reason", "")
+            if unavailable_reason:
+                raise RuntimeError(unavailable_reason)
             if (
                 "_storage_lock" in state
                 and not state.get("_storage_bound", False)
@@ -431,6 +434,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_unavailable_reason = ""
         self._sidecar_guard_timer: threading.Timer | None = None
         self._sidecar_guard_stopped = threading.Event()
+        self._sidecar_guard_lock = threading.RLock()
         self._store = None
         self._dag = None
         self._lifecycle = None
@@ -855,7 +859,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     model=self._assertion_extraction_model(),
                     timeout_seconds=self._assertion_extraction_timeout(),
                 )
-            self._store.check_sidecars_intact()
             self._storage_bound = True
             self._schedule_sidecar_guard()
         except Exception:
@@ -866,24 +869,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _schedule_sidecar_guard(self) -> None:
         state = object.__getattribute__(self, "__dict__")
-        old_timer = state.get("_sidecar_guard_timer")
-        if old_timer is not None:
-            old_timer.cancel()
-        if state.get("_storage_shutdown", False):
-            return
-        stopped = state.get("_sidecar_guard_stopped")
-        if stopped is None:
-            stopped = threading.Event()
-            state["_sidecar_guard_stopped"] = stopped
-        stopped.clear()
-        timer = threading.Timer(
-            _SIDECAR_GUARD_INTERVAL_SECONDS,
-            LCMEngine._sidecar_guard_tick_for_ref,
-            args=(weakref.ref(self),),
-        )
-        timer.daemon = True
-        state["_sidecar_guard_timer"] = timer
-        timer.start()
+        lock = state.get("_sidecar_guard_lock")
+        if lock is None:
+            lock = threading.RLock()
+            state["_sidecar_guard_lock"] = lock
+        with lock:
+            old_timer = state.get("_sidecar_guard_timer")
+            if old_timer is not None:
+                old_timer.cancel()
+            if state.get("_storage_shutdown", False):
+                return
+            stopped = state.get("_sidecar_guard_stopped")
+            if stopped is None:
+                stopped = threading.Event()
+                state["_sidecar_guard_stopped"] = stopped
+            stopped.clear()
+            timer = threading.Timer(
+                _SIDECAR_GUARD_INTERVAL_SECONDS,
+                LCMEngine._sidecar_guard_tick_for_ref,
+                args=(weakref.ref(self),),
+            )
+            timer.daemon = True
+            state["_sidecar_guard_timer"] = timer
+            timer.start()
 
     @staticmethod
     def _sidecar_guard_tick_for_ref(engine_ref: weakref.ReferenceType["LCMEngine"]) -> None:
@@ -893,24 +901,54 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _sidecar_guard_tick(self) -> None:
         state = object.__getattribute__(self, "__dict__")
-        if state.get("_storage_shutdown", False):
-            return
-        store = state.get("_store")
-        if store is not None and state.get("_storage_bound", False):
-            try:
-                store.check_sidecars_intact()
-            except RuntimeError as exc:
-                state["_storage_unavailable_reason"] = str(exc)
+        lock = state.get("_sidecar_guard_lock")
+        if lock is None:
+            lock = threading.RLock()
+            state["_sidecar_guard_lock"] = lock
+        with lock:
+            stopped = state.get("_sidecar_guard_stopped")
+            if (
+                state.get("_storage_shutdown", False)
+                or (stopped is not None and stopped.is_set())
+            ):
                 return
-            except Exception:
-                logger.exception("LCM sidecar guard failed unexpectedly")
-        self._schedule_sidecar_guard()
+            store = state.get("_store")
+            if store is not None and state.get("_storage_bound", False):
+                try:
+                    store.check_sidecars_intact()
+                except RuntimeError as exc:
+                    state["_storage_unavailable_reason"] = str(exc)
+                    state["_storage_shutdown"] = True
+                    self._close_storage()
+                    return
+                except Exception:
+                    logger.exception("LCM sidecar guard failed unexpectedly")
+            stopped = state.get("_sidecar_guard_stopped")
+            if (
+                not state.get("_storage_shutdown", False)
+                and (stopped is None or not stopped.is_set())
+            ):
+                self._schedule_sidecar_guard()
 
     def _ensure_storage(self) -> None:
         """Bind SQLite helpers on first use of a lazy clone."""
+        reason = self._storage_unavailable_reason
+        if reason:
+            raise RuntimeError(reason)
+        sidecar_failure = load_sidecar_health_failure(self._storage_db_path)
+        if sidecar_failure:
+            self._storage_unavailable_reason = sidecar_failure
+            raise RuntimeError(sidecar_failure)
         if self._storage_bound:
             return
         with self._storage_lock:
+            reason = self._storage_unavailable_reason
+            if reason:
+                raise RuntimeError(reason)
+            sidecar_failure = load_sidecar_health_failure(self._storage_db_path)
+            if sidecar_failure:
+                self._storage_unavailable_reason = sidecar_failure
+                raise RuntimeError(sidecar_failure)
             if self._storage_bound:
                 return
             self._bind_storage(self._storage_db_path, self._storage_hermes_home)
@@ -918,13 +956,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
         state = object.__getattribute__(self, "__dict__")
-        timer = state.get("_sidecar_guard_timer")
-        if timer is not None:
-            timer.cancel()
-            state["_sidecar_guard_timer"] = None
-        stopped = state.get("_sidecar_guard_stopped")
-        if stopped is not None:
-            stopped.set()
+        lock = state.get("_sidecar_guard_lock")
+        if lock is None:
+            lock = threading.RLock()
+            state["_sidecar_guard_lock"] = lock
+        with lock:
+            timer = state.get("_sidecar_guard_timer")
+            if timer is not None:
+                timer.cancel()
+                state["_sidecar_guard_timer"] = None
+            stopped = state.get("_sidecar_guard_stopped")
+            if stopped is not None:
+                stopped.set()
         for attr in (
             "_adaptive_retrieval",
             "_store",
